@@ -1,0 +1,158 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Shan Shui</title>
+<!-- Landscape generator: {Shan, Shui}* by Lingdong Huang, MIT licence, https://github.com/LingDong-/shan-shui-inf -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; cursor: none; background: #000; }
+  body { opacity: 0; transition: opacity 2s; }
+  body.ready { opacity: 1; }
+  #strip { position: absolute; inset: 0; will-change: transform; }
+  .tile { position: absolute; top: 0; height: 100%; isolation: isolate; }
+  .tile svg { display: block; }
+  .light .tile svg { mix-blend-mode: multiply; }
+  .dark .tile svg { mix-blend-mode: screen; }
+</style>
+</head>
+<body>
+<!-- Dark mode: ink luminance -> gold on black. v = 1 - luma(pixel over white), then per-channel gold * v^0.7 -->
+<svg width="0" height="0" style="position:absolute">
+  <filter id="gold" color-interpolation-filters="sRGB">
+    <feColorMatrix type="matrix" values="
+      -0.2126 -0.7152 -0.0722 0 1
+      -0.2126 -0.7152 -0.0722 0 1
+      -0.2126 -0.7152 -0.0722 0 1
+       0       0       0      1 0"/>
+    <feComponentTransfer>
+      <feFuncR type="gamma" amplitude="0.95" exponent="0.7"/>
+      <feFuncG type="gamma" amplitude="0.76" exponent="0.7"/>
+      <feFuncB type="gamma" amplitude="0.36" exponent="0.7"/>
+    </feComponentTransfer>
+  </filter>
+</svg>
+<div id="strip"></div>
+
+<script type="text/plain" id="gen">
+var window = self;
+console.log = function () {};
+/*GENERATOR*/
+var SEED = "";
+onmessage = function (e) {
+  var d = e.data;
+  if (d.seed !== undefined) { SEED = d.seed; Math.seed(SEED); Noise.noise(0); return; }
+  // Reseed per tile: upstream's squaring PRNG loses precision over long runs.
+  Math.seed(SEED + ":" + d.x0);
+  // Chunks are planned up to ~700 units from their slice and a mountain range can reach
+  // ~1500 units right of its anchor, so generate/include a margin to keep tile joins seamless.
+  chunkloader(d.x0, d.x1 + 1600);
+  var s = "";
+  for (var i = 0; i < MEM.chunks.length; i++) {
+    var c = MEM.chunks[i];
+    if (c.x > d.x0 - 1600 && c.x < d.x1 + 1000) s += c.canv;
+  }
+  MEM.chunks = MEM.chunks.filter(function (c) { return c.x > d.x0 - 4000; });
+  postMessage({ x0: d.x0, svg: s });
+};
+</script>
+
+<script>
+  var q = new URLSearchParams(location.search);
+  var DARK = q.get("theme") === "dark";
+  var SPEED = +q.get("speed") || 30;          // screen px per second
+  var SEED = q.get("seed") || String(Date.now());
+  var VIEW_H = 700;                            // world units shown top to bottom (upstream: 800 / 1.142)
+  var TILE_PX = 1024;
+
+  document.body.className = DARK ? "dark" : "light";
+  var strip = document.getElementById("strip");
+  var H = innerHeight, W = innerWidth;
+  var scale = H / VIEW_H;                      // px per world unit
+  var tileW = TILE_PX / scale;                 // world units per tile
+
+  // Paper texture, as upstream: noisy warm off-white (light) or warm near-black (dark).
+  var paper = (function () {
+    var n = 256, cv = document.createElement("canvas");
+    cv.width = cv.height = n;
+    var g = cv.getContext("2d"), im = g.createImageData(n, n);
+    for (var j = 0; j < n; j++) for (var i = 0; i < n; i++) {
+      var smooth = Math.sin(i * Math.PI * 2 / n * 3) * Math.cos(j * Math.PI * 2 / n * 2);
+      var c = DARK ? 4 + smooth * 2 + Math.random() * 6 : 243 + smooth * 1.5 - Math.random() * 16;
+      var k = (j * n + i) * 4;
+      im.data[k] = c; im.data[k + 1] = c * 0.95; im.data[k + 2] = c * 0.85; im.data[k + 3] = 255;
+    }
+    g.putImageData(im, 0, 0);
+    return "url(" + cv.toDataURL() + ")";
+  })();
+
+  var worker = new Worker(URL.createObjectURL(
+    new Blob([document.getElementById("gen").textContent], { type: "text/javascript" })));
+  worker.postMessage({ seed: SEED });
+
+  var tiles = [];        // {el, left}
+  var nextLeft = 0;      // px position of the next tile to request
+  var pending = false;
+  var offset = 0;        // px scrolled
+  var base = 0;          // px rebased away (keeps layout coordinates small)
+  var started = false;
+
+  function request() {
+    if (pending || nextLeft > offset + W + 2 * TILE_PX) return;
+    pending = true;
+    worker.postMessage({ x0: (nextLeft + base) / scale, x1: (nextLeft + base + TILE_PX) / scale });
+  }
+
+  worker.onmessage = function (e) {
+    var x0 = e.data.x0, inner = e.data.svg;
+    if (DARK) {
+      inner = "<g filter='url(#gold)'><rect x='" + (x0 - 2) + "' y='-50' width='" + (tileW * (TILE_PX + 1) / TILE_PX + 4) +
+        "' height='" + (VIEW_H + 100) + "' fill='#fff'/>" + inner + "</g>";
+    }
+    var el = document.createElement("div");
+    el.className = "tile";
+    el.style.left = nextLeft + "px";
+    // Each tile is 1px wider than its slot so the next tile overlaps it: at fractional scroll
+    // offsets both anti-aliased edges would otherwise let the black body show through as a seam.
+    el.style.width = TILE_PX + 1 + "px";
+    el.style.backgroundImage = paper;
+    el.style.backgroundPosition = -nextLeft + "px 0";
+    el.innerHTML = "<svg xmlns='http://www.w3.org/2000/svg' width='" + (TILE_PX + 1) + "' height='" + H +
+      "' viewBox='" + x0 + " 0 " + (tileW * (TILE_PX + 1) / TILE_PX) + " " + VIEW_H + "'>" + inner + "</svg>";
+    strip.appendChild(el);
+    tiles.push({ el: el, left: nextLeft });
+    nextLeft += TILE_PX;
+    pending = false;
+    if (!started && nextLeft >= W + TILE_PX) { started = true; document.body.classList.add("ready"); last = performance.now(); }
+    request();
+  };
+
+  var last = 0;
+  function frame(t) {
+    if (started) {
+      offset += Math.max(0, Math.min(t - last, 100)) / 1000 * SPEED;
+      last = t;
+      while (tiles.length && tiles[0].left + TILE_PX < offset) strip.removeChild(tiles.shift().el);
+      if (offset > 200000 && !pending) {           // rebase long runs back near zero
+        var shift = tiles.length ? tiles[0].left : Math.floor(offset);
+        tiles.forEach(function (tl) { tl.left -= shift; tl.el.style.left = tl.left + "px"; });
+        offset -= shift; nextLeft -= shift; base += shift;
+      }
+      strip.style.transform = "translate3d(" + (-offset) + "px,0,0)";
+    }
+    request();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  addEventListener("resize", function () { location.reload(); });
+
+  // Any real input ends the screensaver (the host listens for this message).
+  function quit() { if (window.chrome && chrome.webview) chrome.webview.postMessage("quit"); }
+  var mx = null, my = null;
+  addEventListener("mousemove", function (e) {
+    if (mx === null) { mx = e.screenX; my = e.screenY; return; }
+    if (Math.abs(e.screenX - mx) + Math.abs(e.screenY - my) > 10) quit();
+  });
+  ["mousedown", "keydown", "wheel", "touchstart"].forEach(function (t) { addEventListener(t, quit); });
+</script>
+</body>
+</html>

@@ -1,4 +1,10 @@
 # {Shan, Shui}*
+
+> **This fork adds a Windows screensaver**: an endless, slowly scrolling landscape with a light (ink on paper) or dark (gold on black) theme, plus a live preview in Windows' screen saver settings.
+> Download the installer zip from [Releases](https://github.com/CiphemonJY/shan-shui-inf/releases/latest); details are in [`screensaver/`](screensaver/README.md).
+>
+> ![Dark theme](screensaver/screenshots/dark.jpg)
+
 Procedurally-generated vector-format infinitely-scrolling Chinese landscape for the browser.
 Generate your own on https://lingdong-.github.io/shan-shui-inf/ (or [Alternative link](https://shan-shui-inf.glitch.me)).
 
