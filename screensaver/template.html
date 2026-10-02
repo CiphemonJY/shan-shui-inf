@@ -9,139 +9,219 @@
   body { opacity: 0; transition: opacity 2s; }
   body.ready { opacity: 1; }
   #strip { position: absolute; inset: 0; will-change: transform; }
-  .tile { position: absolute; top: 0; height: 100%; isolation: isolate; }
-  .tile svg { display: block; }
-  .light .tile svg { mix-blend-mode: multiply; }
-  .dark .tile svg { mix-blend-mode: screen; }
+  #strip canvas { position: absolute; top: 0; display: block; }
 </style>
 </head>
 <body>
-<!-- Dark mode: ink luminance -> gold on black. v = 1 - luma(pixel over white), then per-channel gold * v^0.7 -->
-<svg width="0" height="0" style="position:absolute">
-  <filter id="gold" color-interpolation-filters="sRGB">
-    <feColorMatrix type="matrix" values="
-      -0.2126 -0.7152 -0.0722 0 1
-      -0.2126 -0.7152 -0.0722 0 1
-      -0.2126 -0.7152 -0.0722 0 1
-       0       0       0      1 0"/>
-    <feComponentTransfer>
-      <feFuncR type="gamma" amplitude="0.95" exponent="0.7"/>
-      <feFuncG type="gamma" amplitude="0.76" exponent="0.7"/>
-      <feFuncB type="gamma" amplitude="0.36" exponent="0.7"/>
-    </feComponentTransfer>
-  </filter>
-</svg>
 <div id="strip"></div>
 
 <script type="text/plain" id="gen">
 var window = self;
 console.log = function () {};
 /*GENERATOR*/
-var SEED = "";
+// The worker also paints each tile to a bitmap, so the page never parses or rasterizes the
+// tile's SVG (10-20 MB of markup), which used to block its main thread for up to a second.
+var SEED = "", DARK = false, PAPER = null, cv = null, g = null;
+var GOLD = [0.95, 0.76, 0.36].map(function (a) {
+  var t = new Float64Array(256);
+  for (var l = 0; l < 256; l++) t[l] = 255 * a * Math.pow(1 - l / 255, 0.7);
+  return t;
+});
 onmessage = function (e) {
   var d = e.data;
-  if (d.seed !== undefined) { SEED = d.seed; Math.seed(SEED); Noise.noise(0); return; }
+  if (d.seed !== undefined) { SEED = d.seed; DARK = d.dark; PAPER = d.paper; Math.seed(SEED); Noise.noise(0); return; }
   // Reseed per tile: upstream's squaring PRNG loses precision over long runs.
   Math.seed(SEED + ":" + d.x0);
   // Chunks are planned up to ~700 units from their slice and a mountain range can reach
   // ~1500 units right of its anchor, so generate/include a margin to keep tile joins seamless.
-  chunkloader(d.x0, d.x1 + 1600);
-  var s = "";
-  for (var i = 0; i < MEM.chunks.length; i++) {
-    var c = MEM.chunks[i];
-    if (c.x > d.x0 - 1600 && c.x < d.x1 + 1000) s += c.canv;
-  }
+  var x1 = d.x0 + d.w / d.k;
+  chunkloader(d.x0, x1 + 1600);
+  var im = ink(MEM.chunks.filter(function (c) { return c.x > d.x0 - 1600 && c.x < x1 + 1000; }), d);
   MEM.chunks = MEM.chunks.filter(function (c) { return c.x > d.x0 - 4000; });
-  postMessage({ x0: d.x0, svg: s });
+  paper(im, d);
+  createImageBitmap(im).then(function (b) { postMessage({ i: d.i, bmp: b }, [b]); });
 };
+
+// Render the chunks' SVG onto white as the browser would: document order, fill then stroke,
+// SVG defaults. Upstream emits <polyline> plus the odd <text> sign (and debug <circle>s).
+// Points are shifted by x0 in double precision first: canvas geometry is single precision
+// and x0 grows without bound.
+function ink(chunks, d) {
+  var w = d.w + 1, h = d.h, k = d.k, x0 = d.x0, xr = x0 + w / k;
+  if (!cv || cv.width !== w || cv.height !== h) {
+    cv = new OffscreenCanvas(w, h);
+    g = cv.getContext("2d", { willReadFrequently: true });   // CPU raster: keep the GPU free for the scroll
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.fillStyle = "#fff";
+  g.fillRect(0, 0, w, h);
+  g.miterLimit = 4;
+  for (var c = 0; c < chunks.length; c++) {
+    var s = chunks[c].canv;
+    for (var i = s.indexOf("<"); i >= 0; i = s.indexOf("<", i + 1)) {
+      var end = s.indexOf(">", i), o = props(s.substring(i, end));
+      if (s.startsWith("<polyline", i)) {
+        var p = (o.points || "").trim().split(/[\s,]+/), n = p.length & ~1, lo = Infinity, hi = -Infinity;
+        if (n < 4) continue;
+        for (var j = 0; j < n; j += 2) { var x = +p[j]; if (x < lo) lo = x; if (x > hi) hi = x; }
+        var pad = 2 + (+o["stroke-width"] || 0);
+        if (hi < x0 - pad || lo > xr + pad) continue;
+        g.beginPath();
+        g.moveTo((p[0] - x0) * k, p[1] * k);
+        for (j = 2; j < n; j += 2) g.lineTo((p[j] - x0) * k, p[j + 1] * k);
+        paint(o, k);
+      } else if (s.startsWith("<circle", i)) {
+        g.beginPath();
+        g.arc((o.cx - x0) * k, o.cy * k, o.r * k, 0, 2 * Math.PI);
+        paint(o, k);
+      } else if (s.startsWith("<text", i)) {
+        var tf = o.transform || "", tr = /translate\(\s*([^\s,)]+)[\s,]*([^\s,)]*)/.exec(tf), ro = /rotate\(\s*([^\s,)]+)/.exec(tf);
+        var fill = o.fill === undefined ? "black" : o.fill, txt = s.substring(end + 1, s.indexOf("</text>", end));
+        if (!shows(fill)) continue;
+        g.save();
+        g.translate(((tr ? +tr[1] : 0) - x0) * k, (tr ? +tr[2] || 0 : 0) * k);
+        if (ro) g.rotate(ro[1] * Math.PI / 180);
+        g.font = (+o["font-size"] || 16) * k + "px " + (o["font-family"] || "serif");
+        g.textAlign = { middle: "center", end: "end" }[o["text-anchor"]] || "start";
+        g.fillStyle = fill;
+        g.fillText(txt.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&"),
+          (+o.x || 0) * k, (+o.y || 0) * k);
+        g.restore();
+      }
+    }
+  }
+  return g.getImageData(0, 0, w, h);
+}
+
+// Attributes of one tag, with style declarations overriding them as in CSS.
+function props(t) {
+  var o = {}, m, re = /([\w-]+)\s*=\s*(['"])([^'"]*)\2/g;
+  while ((m = re.exec(t))) o[m[1]] = m[3];
+  if (o.style) o.style.split(";").forEach(function (q) {
+    var j = q.indexOf(":");
+    if (j > 0) o[q.slice(0, j).trim()] = q.slice(j + 1).trim();
+  });
+  return o;
+}
+
+function shows(c) { return c !== "none" && c !== "transparent" && !/,\s*0\s*\)$/.test(c); }
+
+function paint(o, k) {
+  var fill = o.fill === undefined ? "black" : o.fill, stroke = o.stroke || "none";
+  var sw = o["stroke-width"] === undefined ? 1 : +o["stroke-width"];
+  if (shows(fill)) { g.fillStyle = fill; g.fill(); }
+  if (shows(stroke) && sw > 0) { g.strokeStyle = stroke; g.lineWidth = sw * k; g.stroke(); }
+}
+
+// Lay the ink on the paper texture (sampled per CSS px, continuous across tiles). Light: multiply.
+// Dark: ink luminance -> gold (v = 1 - luma, channel = gold * v^0.7), screened onto dark paper.
+function paper(im, d) {
+  var p = im.data, w = im.width, h = im.height, P = PAPER, col = new Int32Array(w);
+  var R = GOLD[0], G = GOLD[1], B = GOLD[2];
+  for (var x = 0; x < w; x++) col[x] = (Math.floor((d.gx + x) / d.dpr) & 255) * 4;
+  for (var y = 0, o = 0; y < h; y++) {
+    var row = (Math.floor(y / d.dpr) & 255) * 1024;
+    for (x = 0; x < w; x++, o += 4) {
+      var q = row + col[x], pr = P[q], pg = P[q + 1], pb = P[q + 2];
+      if (DARK) {
+        var l = (0.2126 * p[o] + 0.7152 * p[o + 1] + 0.0722 * p[o + 2] + 0.5) | 0;
+        p[o] = R[l] + pr - R[l] * pr / 255;
+        p[o + 1] = G[l] + pg - G[l] * pg / 255;
+        p[o + 2] = B[l] + pb - B[l] * pb / 255;
+      } else {
+        p[o] = p[o] * pr / 255;
+        p[o + 1] = p[o + 1] * pg / 255;
+        p[o + 2] = p[o + 2] * pb / 255;
+      }
+    }
+  }
+}
 </script>
 
 <script>
   var q = new URLSearchParams(location.search);
   var DARK = q.get("theme") === "dark";
-  var SPEED = +q.get("speed") || 30;          // screen px per second
+  var SPEED = +q.get("speed") || 30;          // CSS px per second
   var SEED = q.get("seed") || String(Date.now());
   var VIEW_H = 700;                            // world units shown top to bottom (upstream: 800 / 1.142)
-  var TILE_PX = 1024;
+  var DPR = devicePixelRatio || 1;
+  var W = innerWidth, H = innerHeight;
+  var HD = Math.round(H * DPR);                // tile height, device px
+  var TILE = Math.round(1024 * DPR);           // tile width, device px (1024 CSS px)
+  var TILE_CSS = TILE / DPR;
+  var scale = HD / VIEW_H;                     // device px per world unit
+  var LAP = 1e6;                               // px the scroll animation spans; rebased long before its end
 
-  document.body.className = DARK ? "dark" : "light";
   var strip = document.getElementById("strip");
-  var H = innerHeight, W = innerWidth;
-  var scale = H / VIEW_H;                      // px per world unit
-  var tileW = TILE_PX / scale;                 // world units per tile
 
   // Paper texture, as upstream: noisy warm off-white (light) or warm near-black (dark).
   var paper = (function () {
-    var n = 256, cv = document.createElement("canvas");
-    cv.width = cv.height = n;
-    var g = cv.getContext("2d"), im = g.createImageData(n, n);
+    var n = 256, d = new Uint8ClampedArray(n * n * 4);
     for (var j = 0; j < n; j++) for (var i = 0; i < n; i++) {
       var smooth = Math.sin(i * Math.PI * 2 / n * 3) * Math.cos(j * Math.PI * 2 / n * 2);
       var c = DARK ? 4 + smooth * 2 + Math.random() * 6 : 243 + smooth * 1.5 - Math.random() * 16;
       var k = (j * n + i) * 4;
-      im.data[k] = c; im.data[k + 1] = c * 0.95; im.data[k + 2] = c * 0.85; im.data[k + 3] = 255;
+      d[k] = c; d[k + 1] = c * 0.95; d[k + 2] = c * 0.85; d[k + 3] = 255;
     }
-    g.putImageData(im, 0, 0);
-    return "url(" + cv.toDataURL() + ")";
+    return d;
   })();
 
   var worker = new Worker(URL.createObjectURL(
     new Blob([document.getElementById("gen").textContent], { type: "text/javascript" })));
-  worker.postMessage({ seed: SEED });
+  worker.postMessage({ seed: SEED, dark: DARK, paper: paper });
 
-  var tiles = [];        // {el, left}
-  var nextLeft = 0;      // px position of the next tile to request
+  var tiles = [];        // {i, el}, tile i spans CSS px [(i - first) * TILE_CSS, +TILE_CSS] in the strip
+  var next = 0;          // index of the next tile to request
+  var first = 0;         // tile index at strip x = 0 (advanced when rebasing)
   var pending = false;
-  var offset = 0;        // px scrolled
-  var base = 0;          // px rebased away (keeps layout coordinates small)
-  var started = false;
+  var anim = null;       // the scroll: a Web Animation, so it runs on the compositor thread
+
+  function scrolled() { return anim ? Math.max(0, anim.currentTime || 0) * SPEED / 1000 : 0; }
 
   function request() {
-    if (pending || nextLeft > offset + W + 2 * TILE_PX) return;
+    if (pending || (next - first) * TILE_CSS > scrolled() + W + 2 * TILE_CSS) return;
     pending = true;
-    worker.postMessage({ x0: (nextLeft + base) / scale, x1: (nextLeft + base + TILE_PX) / scale });
+    worker.postMessage({ i: next, x0: next * TILE / scale, w: TILE, h: HD, k: scale, gx: next * TILE, dpr: DPR });
   }
 
   worker.onmessage = function (e) {
-    var x0 = e.data.x0, inner = e.data.svg;
-    if (DARK) {
-      inner = "<g filter='url(#gold)'><rect x='" + (x0 - 2) + "' y='-50' width='" + (tileW * (TILE_PX + 1) / TILE_PX + 4) +
-        "' height='" + (VIEW_H + 100) + "' fill='#fff'/>" + inner + "</g>";
-    }
-    var el = document.createElement("div");
-    el.className = "tile";
-    el.style.left = nextLeft + "px";
-    // Each tile is 1px wider than its slot so the next tile overlaps it: at fractional scroll
+    var b = e.data.bmp, el = document.createElement("canvas");
+    el.width = b.width;
+    el.height = b.height;
+    // Each tile is 1 device px wider than its slot so the next tile overlaps it: at fractional scroll
     // offsets both anti-aliased edges would otherwise let the black body show through as a seam.
-    el.style.width = TILE_PX + 1 + "px";
-    el.style.backgroundImage = paper;
-    el.style.backgroundPosition = -nextLeft + "px 0";
-    el.innerHTML = "<svg xmlns='http://www.w3.org/2000/svg' width='" + (TILE_PX + 1) + "' height='" + H +
-      "' viewBox='" + x0 + " 0 " + (tileW * (TILE_PX + 1) / TILE_PX) + " " + VIEW_H + "'>" + inner + "</svg>";
+    el.style.width = b.width / DPR + "px";
+    el.style.height = b.height / DPR + "px";
+    el.style.left = (e.data.i - first) * TILE_CSS + "px";
+    el.getContext("bitmaprenderer").transferFromImageBitmap(b);
     strip.appendChild(el);
-    tiles.push({ el: el, left: nextLeft });
-    nextLeft += TILE_PX;
+    tiles.push({ i: e.data.i, el: el });
+    next = e.data.i + 1;
     pending = false;
-    if (!started && nextLeft >= W + TILE_PX) { started = true; document.body.classList.add("ready"); last = performance.now(); }
+    if (!anim && (next - first) * TILE_CSS >= W + TILE_CSS) {
+      document.body.classList.add("ready");
+      anim = strip.animate([{ transform: "translateX(0)" }, { transform: "translateX(" + -LAP + "px)" }],
+        { duration: LAP / SPEED * 1000, easing: "linear", fill: "forwards" });
+    }
     request();
   };
 
-  var last = 0;
-  function frame(t) {
-    if (started) {
-      offset += Math.max(0, Math.min(t - last, 100)) / 1000 * SPEED;
-      last = t;
-      while (tiles.length && tiles[0].left + TILE_PX < offset) strip.removeChild(tiles.shift().el);
-      if (offset > 200000 && !pending) {           // rebase long runs back near zero
-        var shift = tiles.length ? tiles[0].left : Math.floor(offset);
-        tiles.forEach(function (tl) { tl.left -= shift; tl.el.style.left = tl.left + "px"; });
-        offset -= shift; nextLeft -= shift; base += shift;
-      }
-      strip.style.transform = "translate3d(" + (-offset) + "px,0,0)";
+  // Housekeeping only; the motion itself never waits on this thread.
+  function frame() {
+    var x = scrolled();
+    while (tiles.length > 1 && (tiles[0].i - first + 1) * TILE_CSS < x - 1) strip.removeChild(tiles.shift().el);
+    if (x > 100000 && tiles.length && anim.startTime !== null) {
+      // Rebase long runs back near zero: move the tiles left by whole tiles and delay the
+      // animation's start by the same distance, in one frame, so nothing visibly moves.
+      var n = tiles[0].i - first;
+      first += n;
+      tiles.forEach(function (t) { t.el.style.left = (t.i - first) * TILE_CSS + "px"; });
+      anim.startTime += n * TILE_CSS / SPEED * 1000;
     }
     request();
     requestAnimationFrame(frame);
   }
+  request();
   requestAnimationFrame(frame);
   addEventListener("resize", function () { location.reload(); });
 

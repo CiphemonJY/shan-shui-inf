@@ -31,9 +31,11 @@ This runs `build.py`, which combines the fork's root `index.html` generator with
 For a quick framework-dependent build: `python build.py`, then `dotnet publish ShanShui.csproj -c Release -o bin/out`, then rename `ShanShui.exe` to `ShanShui.scr`. To preview the page in a browser, serve `web/` and open `index.html?theme=dark&speed=30&seed=42`.
 
 ## How it works
-- The upstream generator runs unmodified in a Web Worker. The page asks it for 1024-px tiles ahead of the viewport and scrolls them with a GPU transform.
+- The upstream generator runs unmodified in a Web Worker. The page asks it for 1024-px tiles ahead of the viewport.
+- The worker also paints each tile's SVG output to a bitmap with Canvas 2D on an `OffscreenCanvas` and hands the bitmap to the page. A tile produces 10–20 MB of SVG markup, and parsing and painting that on the page's main thread used to freeze the scroll for up to a second every time a tile arrived.
+- The scroll is a Web Animations transform, which runs on the browser's compositor thread, so the main thread cannot stall it. Every 100,000 px the tiles and the animation are moved back toward zero in the same frame.
 - Each tile includes chunks from ±1600 world units and overlaps its neighbour by 1 px, so the joins between tiles are seamless.
-- Dark mode uses an SVG `feColorMatrix` filter that maps ink density to gold.
+- Dark mode maps ink density to gold per pixel (`v = 1 − luma`, each channel `gold × v^0.7`).
 - The C# host (`Program.cs`) opens a borderless WebView2 on each screen and exits on input. It serves the embedded page from memory rather than extracting it to disk.
 - For `/p <hwnd>` it re-parents itself into the Settings dialog's preview picture, scales the speed to that size, and exits when that window goes away.
 
